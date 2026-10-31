@@ -83,6 +83,8 @@ name, and an absolute path leaves the plugin card reading "installed, not loaded
   "cooldownMs": 2000,
   "includeSubagents": false,
   "stallMs": 120000,
+  "wakeFallbackMs": 3000,
+  "bootMarker": true,
   "log": true
 }
 ```
@@ -96,13 +98,15 @@ name, and an absolute path leaves the plugin card reading "installed, not loaded
 | `cooldownMs` | ms | Minimum gap between two hard interrupts on one agent |
 | `includeSubagents` | bool | Also handle sub-agents (default: only root sessions you can see) |
 | `stallMs` | ms, `0` disables | Write a "still running" line to the log when a single step exceeds this |
+| `wakeFallbackMs` | ms, `0` disables | How long to wait for the driver to report idle after a hard interrupt; only used on the degraded path |
+| `bootMarker` | bool | Write `~/.dsh/dsh-interject-boot.json` (version / pid / effective config) |
 | `log` | bool | Diagnostic log switch |
 
 **The default never interrupts.** To make Cmd/Ctrl+Enter a preemption gesture:
 `{"onSteer": "interrupt"}`. To switch the plugin off: `{"enabled": false}`.
 
 Environment overrides: `DSH_INTERJECT_CONFIG` (config path), `DSH_INTERJECT_LOG` (log path;
-empty string disables logging).
+empty string disables logging), `DSH_INTERJECT_BOOT` (boot marker path).
 
 ---
 
@@ -128,11 +132,25 @@ A working promotion logs `next-turn -> next-step <id>`. If a single step exceeds
 stuck" from "a long turn made of many normal steps" (the UI's "thinking, X elapsed" counts the
 **whole turn**).
 
+**Which build is the live process running?** (editing `lib/index.js` needs a restart, and after a
+restart it is easy to doubt whether it took):
+
+```powershell
+Get-Content "$env:USERPROFILE\.dsh\dsh-interject-boot.json"
+```
+
+`version` there is the build the running process actually loaded. The log is append-only, so
+seeing an old config line proves nothing; this file is rewritten wholesale on every `apply()`.
+
+> The test scripts redirect their own boot marker to a temp dir via `DSH_INTERJECT_BOOT`;
+> otherwise running the self-check would overwrite this evidence. If the `pid` in this file is not
+> your DSH process, something else wrote it.
+
 Offline self-check, no DSH needed:
 
 ```bash
-node test/test-interject.mjs        # 39 checks: policy, capability probing, degraded paths
-node test/test-interject-loop.mjs   # 15 checks: mini driver transcribed from agent-loop
+node test/test-interject.mjs        # 46 checks: policy, capability probing, degraded paths
+node test/test-interject-loop.mjs   # 18 checks: mini driver transcribed from agent-loop
 ```
 
 Both scripts import `../lib/index.js` by default; set `DSH_INTERJECT_ENTRY` to test another build.
@@ -153,8 +171,8 @@ line to confirm the public surface this plugin uses:
 Every capability is **probed, not assumed** — the plugin imports no `@deepseek-ai/*` package and
 uses only the `ctx` / `agent` objects the host passes in. That is not for the sake of older
 versions: it is so a future rename of an internal field degrades the plugin instead of breaking it.
-Anything undetectable falls back to a public path (for example, no `phase` means `remove` +
-`followup` instead of the wake latch).
+Anything undetectable falls back to a public path (for example, no `phase` means "wait for
+`agent/status` to report idle, then `steer`" instead of the wake latch).
 
 The three versions agree on: `ctx.agents.get/roots`, `agent.session`, `agent.status`,
 `agent.inbox.{nextTurn,nextStep,hasPending,claim,append,prepend,replace,remove,splice}`,
@@ -173,8 +191,10 @@ and the internal field `agent.phase.wakeRequested`.
   shape of the public API (`inbox.remove()` goes through `splice()`). Verified harmless: the goal
   driver's `sameQueued()` requires `source.kind === 'goal'`, and the UI's
   `retireFailedSubmission()` raises nothing for a plain-text submission.
-- **`interrupt` mode depends on `agent.phase.wakeRequested`**, the one internal field this plugin
-  touches. Without it the plugin falls back to `inbox.remove()` + `agent.followup()`.
+- **`interrupt` mode prefers the internal `agent.phase.wakeRequested`** — latching it keeps the
+  driver alive in the same turn, which is fastest. When it cannot be latched the plugin falls back
+  to a **public path**: wait for the `agent/status` event to report idle, then `steer()` the
+  message, with a `wakeFallbackMs` timeout. Both paths are covered by offline tests.
 - **Editing `lib/index.js` requires a full DSH restart** (tray exit, not just closing the window).
   Only the JSON config is hot-reloaded.
 
