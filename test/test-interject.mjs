@@ -6,9 +6,16 @@ import os from 'node:os'
 import path from 'node:path'
 import { fileURLToPath, pathToFileURL } from 'node:url'
 
-// 默认测同仓库的 lib/index.js；DSH_INTERJECT_ENTRY 可指向别处的构建产物。
-const PLUGIN = process.env.DSH_INTERJECT_ENTRY
-  || fileURLToPath(new URL('../lib/index.js', import.meta.url))
+// 默认测本仓库的 lib/index.js（相对本文件定位，任何机器上都能跑）；
+// 用 DSH_INTERJECT_ENTRY 指向别的构建产物。仓库外的副本（例如放进别处当调试脚本）
+// 找不到 ../lib 时退回到本机安装位置。
+function defaultPlugin () {
+  const local = fileURLToPath(new URL('../lib/index.js', import.meta.url))
+  if (fs.existsSync(local)) return local
+  return path.join(os.homedir(), '.dsh', 'plugins', 'dsh-interject', 'lib', 'index.js')
+}
+
+const PLUGIN = process.env.DSH_INTERJECT_ENTRY || defaultPlugin()
 
 const mod = await import(pathToFileURL(PLUGIN).href)
 
@@ -88,10 +95,15 @@ const tick = (ms = 0) => new Promise((resolve) => setTimeout(resolve, ms))
 
 const tmpConfig = path.join(os.tmpdir(), `dsh-interject-test-${process.pid}.json`)
 const tmpLog = path.join(os.tmpdir(), `dsh-interject-test-${process.pid}.log`)
+// 必须重定向 boot 标记，否则每跑一次测试都会覆盖 ~/.dsh/dsh-interject-boot.json，
+// 把「活着的 DSH 进程跑的是哪一版」这个唯一可信的证据冲掉。
+const tmpBoot = path.join(os.tmpdir(), `dsh-interject-test-${process.pid}-boot.json`)
 process.env.DSH_INTERJECT_CONFIG = tmpConfig
 process.env.DSH_INTERJECT_LOG = tmpLog
+process.env.DSH_INTERJECT_BOOT = tmpBoot
 try { fs.unlinkSync(tmpConfig) } catch {}
 try { fs.unlinkSync(tmpLog) } catch {}
+try { fs.unlinkSync(tmpBoot) } catch {}
 const writeConfig = (obj) => fs.writeFileSync(tmpConfig, JSON.stringify(obj), 'utf8')
 const clearConfig = () => { try { fs.unlinkSync(tmpConfig) } catch {} }
 
@@ -264,7 +276,10 @@ const INTERRUPT = { graceMs: 0, onQueue: 'interrupt' }
   eq('t8d 不升格', a.inbox.nextStep.length, 0)
 }
 
-// ── 用例 9：拿不到内部 phase 时，走 remove+followup 退化路径 ────────────────
+// ── 用例 9：拿不到内部 phase 时，等 agent/status 报 idle 再补送 ─────────────
+// 旧行为是 remove + followup 重入队；但 cancel 之后 phase.abort 已 aborted，
+// send() 里的 wakingAfterAbort 会把消息改写回 next-turn —— 等于又回到「等整个 turn」。
+// 新行为：先摘出收件箱，等公开的 agent/status 报 idle 再 steer 送过去。
 {
   clearConfig()
   const w = makeWorld()
@@ -274,8 +289,47 @@ const INTERRUPT = { graceMs: 0, onQueue: 'interrupt' }
   a.followup(userMsg('m9'))
   await tick(5)
   eq('t9 正常打断', a.calls.cancel.length, 1)
-  eq('t9 已重新入队唤醒', a.calls.followup.length, 2)
-  check('t9 消息还在待处理', a.inbox.nextTurn.some((m) => m.id === 'm9'))
+  eq('t9 没有退回 followup 重入队', a.calls.followup.length, 1)
+  check('t9 消息已摘出收件箱（避免与 steer 撞去重校验）', !a.inbox.nextTurn.some((m) => m.id === 'm9'))
+  // driver 收尾 → setPhase 发 agent/status
+  a.status = 'idle'
+  w.emit('agent/status', { agent: a, status: 'idle' })
+  await tick(5)
+  eq('t9 idle 后用 steer 补送', a.calls.steer, ['m9'])
+  check('t9 消息已落到 next-step', a.inbox.nextStep.some((m) => m.id === 'm9'))
+}
+
+// ── 用例 9b：闩不上唤醒 + 一直不回 idle → 兜底超时照样送 ────────────────────
+{
+  clearConfig()
+  const w = makeWorld()
+  mod.apply(w.ctx, { ...INTERRUPT, wakeFallbackMs: 20 })
+  const a = w.makeAgent('s9b', { withPhase: false })
+  w.emit('session/event', a.session, { type: 'step/start' })
+  a.followup(userMsg('m9b'))
+  await tick(5)
+  eq('t9b 已打断', a.calls.cancel.length, 1)
+  eq('t9b 还没送', a.calls.steer.length, 0)
+  await tick(60)
+  eq('t9b 超时兜底送出去了', a.calls.steer, ['m9b'])
+}
+
+// ── 用例 9c：agent/status 报 running 时不提前送 ─────────────────────────────
+{
+  clearConfig()
+  const w = makeWorld()
+  mod.apply(w.ctx, INTERRUPT)
+  const a = w.makeAgent('s9c', { withPhase: false })
+  w.emit('session/event', a.session, { type: 'step/start' })
+  a.followup(userMsg('m9c'))
+  await tick(5)
+  w.emit('agent/status', { agent: a, status: 'running' })
+  await tick(5)
+  eq('t9c running 时不动手', a.calls.steer.length, 0)
+  a.status = 'idle'
+  w.emit('agent/status', { agent: a, status: 'idle' })
+  await tick(5)
+  eq('t9c idle 后才送', a.calls.steer, ['m9c'])
 }
 
 // ── 用例 10：graceMs 等待期间消息被领走 → 不再打断 ─────────────────────────
