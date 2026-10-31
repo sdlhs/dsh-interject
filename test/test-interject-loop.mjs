@@ -8,9 +8,24 @@
 import path from 'node:path'
 import { fileURLToPath, pathToFileURL } from 'node:url'
 
-const PLUGIN = process.env.DSH_INTERJECT_ENTRY
-  || fileURLToPath(new URL('../lib/index.js', import.meta.url))
+// 默认测本仓库的 lib/index.js（相对本文件定位，任何机器上都能跑）；
+// 用 DSH_INTERJECT_ENTRY 指向别的构建产物。仓库外的副本（例如放进别处当调试脚本）
+// 找不到 ../lib 时退回到本机安装位置。
+import fs from 'node:fs'
+import os from 'node:os'
+
+function defaultPlugin () {
+  const local = fileURLToPath(new URL('../lib/index.js', import.meta.url))
+  if (fs.existsSync(local)) return local
+  return path.join(os.homedir(), '.dsh', 'plugins', 'dsh-interject', 'lib', 'index.js')
+}
+
+const PLUGIN = process.env.DSH_INTERJECT_ENTRY || defaultPlugin()
 const mod = await import(pathToFileURL(PLUGIN).href)
+
+// 必须重定向 boot 标记，否则每跑一次测试都会覆盖 ~/.dsh/dsh-interject-boot.json，
+// 把「活着的 DSH 进程跑的是哪一版」这个唯一可信的证据冲掉。
+process.env.DSH_INTERJECT_BOOT = path.join(process.env.TEMP ?? '/tmp', `dsh-interject-loop-boot-${process.pid}.json`)
 
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms))
 let pass = 0
@@ -50,6 +65,14 @@ class MiniAgent {
 
   get status () { return this.phase.kind === 'idle' ? 'idle' : 'running' }
 
+  // — 照抄 ReactLoopAgent.setPhase（状态翻转时才发事件）—
+  setPhase (next) {
+    const previousStatus = this.status
+    this.phase = next
+    const status = this.status
+    if (status !== previousStatus) this.bus.emit('agent/status', { agent: this, status })
+  }
+
   hasPending () {
     return this.inbox.nextTurn.length > 0 || this.inbox.nextStep.length > 0
   }
@@ -84,7 +107,7 @@ class MiniAgent {
       return
     }
     const lastTurn = this.phase.lastTurn ?? 0
-    this.phase = { kind: 'running', abort: new AbortController(), turn: lastTurn, step: 0, wakeRequested: false }
+    this.setPhase({ kind: 'running', abort: new AbortController(), turn: lastTurn, step: 0, wakeRequested: false })
     this.activity = this.kick()
   }
 
@@ -95,7 +118,7 @@ class MiniAgent {
     } catch { /* 中止/失败都被吞掉，真实实现也一样 */ } finally {
       if (this.phase.kind === 'running') {
         const { turn, wakeRequested } = this.phase
-        this.phase = { kind: 'idle', lastTurn: turn }
+        this.setPhase({ kind: 'idle', lastTurn: turn })
         if (wakeRequested && this.hasPending()) this.wakeDriver()
       }
     }
@@ -273,6 +296,33 @@ const msg = (id) => ({ id, content: [{ type: 'text', text: id }], source: { kind
   check('D(反证): driver 停在 idle', agent.status === 'idle', agent.status)
   check('D(反证): d2 僵死在收件箱里', agent.inbox.nextTurn.some((m) => m.id === 'd2'))
   check('D(反证): d2 没有被领到', !agent.admitted.flat().includes('d2'), JSON.stringify(agent.admitted))
+}
+
+// ── 用例 E：闩不上唤醒（没有 phase.wakeRequested）→ 等 agent/status 报 idle 再补送 ──
+// 这条是「公开接口退路」的集成验证：不摸任何内部字段，只靠 agent/status 事件
+// 也能把被打断后残留的消息送到模型面前。
+{
+  process.env.DSH_INTERJECT_CONFIG = path.join(process.env.TEMP ?? '/tmp', 'dsh-interject-loop-none.json')
+  process.env.DSH_INTERJECT_LOG = ''
+  const bus = makeBus()
+  mod.apply(bus.ctx, { graceMs: 0, cooldownMs: 0, onQueue: 'interrupt', wakeFallbackMs: 3000 })
+  const agent = new MiniAgent('loop-e', bus, { stepMs: 200 })
+  // 把 phase 换成没有 wakeRequested 字段的形态，模拟「宿主换了实现，内部字段没了」
+  const originalWake = agent.wakeDriver.bind(agent)
+  agent.wakeDriver = (wakeAfterAbort) => {
+    originalWake(wakeAfterAbort)
+    if (agent.phase !== undefined) delete agent.phase.wakeRequested
+  }
+  bus.agents.push(agent)
+
+  agent.followup(msg('e1'))
+  await sleep(40)
+  agent.followup(msg('e2'))              // 插队：走退化路径
+  await sleep(60)
+  check('E: 当前思考被打断', agent.aborted === 1, `aborted=${agent.aborted}`)
+  check('E: 消息先被摘出收件箱', !agent.inbox.nextTurn.some((m) => m.id === 'e2'), JSON.stringify(agent.inbox.nextTurn.map((m) => m.id)))
+  await sleep(700)
+  check('E: 靠 agent/status 补送后仍被领到', JSON.stringify(agent.admitted.flat()).includes('e2'), JSON.stringify(agent.admitted))
 }
 
 console.log(`\n${pass} passed, ${failures.length} failed`)
