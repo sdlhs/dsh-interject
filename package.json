@@ -1,0 +1,64 @@
+{
+  "name": "dsh-interject",
+  "version": "0.2.0",
+  "description": "Delivers queued chat messages at the next step boundary instead of waiting for the whole turn to finish, without aborting the running model call. Host plugin for DeepSeek Harness.",
+  "type": "module",
+  "main": "./lib/index.js",
+  "exports": {
+    ".": "./lib/index.js",
+    "./cordis.patch.yml": "./cordis.patch.yml",
+    "./package.json": "./package.json"
+  },
+  "files": [
+    "lib",
+    "test",
+    "cordis.patch.yml",
+    "README.md",
+    "README.zh.md",
+    "LICENSE"
+  ],
+  "scripts": {
+    "test": "node test/test-interject.mjs && node test/test-interject-loop.mjs"
+  },
+  "engines": {
+    "node": ">=20",
+    "dsh": ">=0.2.0-rc.1 <0.3.0-0 || >=0.2.1-0 <0.3.0-0 || >=0.2.2-0 <0.3.0-0 || >=0.3.0-0"
+  },
+  "peerDependencies": {
+    "@deepseek-ai/dsh": ">=0.2.0-rc.1 <0.3.0-0 || >=0.2.1-0 <0.3.0-0 || >=0.2.2-0 <0.3.0-0 || >=0.3.0-0"
+  },
+  "peerDependenciesMeta": {
+    "@deepseek-ai/dsh": {
+      "optional": true
+    }
+  },
+  "dsh": {
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    }
+  },
+  "keywords": [
+    "dsh",
+    "dsh-plugin",
+    "deepseek-harness",
+    "interject",
+    "steer",
+    "inbox",
+    "queue"
+  ],
+  "author": "sdlhs",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/sdlhs/dsh-interject.git"
+  },
+  "homepage": "https://github.com/sdlhs/dsh-interject#readme",
+  "bugs": {
+    "url": "https://github.com/sdlhs/dsh-interject/issues"
+  },
+  "os": [
+    "darwin",
+    "linux",
+    "win32"
+  ]
+}

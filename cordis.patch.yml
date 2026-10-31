@@ -1,0 +1,11 @@
+# Bundle patch layer for dsh-interject.
+#
+# The row name is a PACKAGE name, resolved by the profile's own node_modules —
+# not an absolute path. The market matches loader entries by name, so an
+# absolute path makes the plugin card read "installed, not loaded" forever.
+#
+# Policy is NOT configured here: it lives in ~/.dsh/dsh-interject.json, which is
+# hot-reloaded on save (no restart needed).
+- insert:
+    - id: dsh-interject
+      name: dsh-interject
