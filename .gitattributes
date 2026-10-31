@@ -1,0 +1,2 @@
+# Normalize line endings so a Windows clone and a Linux CI runner see the same bytes.
+* text=auto eol=lf
