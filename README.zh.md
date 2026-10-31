@@ -79,6 +79,8 @@ dsh plugin --profile desktop add .
   "cooldownMs": 2000,
   "includeSubagents": false,
   "stallMs": 120000,
+  "wakeFallbackMs": 3000,
+  "bootMarker": true,
   "log": true
 }
 ```
@@ -92,12 +94,15 @@ dsh plugin --profile desktop add .
 | `cooldownMs` | 毫秒 | 两次硬打断的最小间隔 |
 | `includeSubagents` | bool | 是否也管子 agent（默认只管你看得见的根会话） |
 | `stallMs` | 毫秒，`0` 关闭 | 单步超过这么久就在日志里写一行「还在跑」 |
+| `wakeFallbackMs` | 毫秒，`0` 关闭 | 硬打断后等 driver 回到 idle 的最长时间；只在「拿不到内部唤醒字段」的退化路径上用到 |
+| `bootMarker` | bool | 是否写 `~/.dsh/dsh-interject-boot.json`（含版本号 / pid / 生效配置） |
 | `log` | bool | 诊断日志开关 |
 
 **默认 = 完全不打断。** 想让 Cmd+Enter 变成抢断手势：`{"onSteer": "interrupt"}`。
 想彻底关掉：`{"enabled": false}`。
 
-环境变量覆盖：`DSH_INTERJECT_CONFIG`（配置路径）、`DSH_INTERJECT_LOG`（日志路径，空串关闭日志）。
+环境变量覆盖：`DSH_INTERJECT_CONFIG`（配置路径）、`DSH_INTERJECT_LOG`（日志路径，空串关闭日志）、
+`DSH_INTERJECT_BOOT`（boot 标记路径）。
 
 ---
 
@@ -120,11 +125,23 @@ Get-Content "$env:TEMP\dsh-interject.log" -Tail 20
 `step N of turn M has been running Xs (still going)` —— 用它可以分清「一个请求真卡了」
 和「很多正常 step 堆出来的长 turn」（UI 上那个「深度求索中，用时 X」算的是**整个 turn**）。
 
+**确认活进程跑的是哪一版**（改完代码必须重启，但重启后容易怀疑「到底加载了没」）：
+
+```powershell
+Get-Content "$env:USERPROFILE\.dsh\dsh-interject-boot.json"
+```
+
+里面的 `version` 就是当前进程实际加载的版本号。日志是按时间追加的，看到旧配置行并不能证明
+进程跑的是旧代码；这个文件每次 `apply()` 整份重写，只有真加载了才会更新。
+
+> 测试脚本会把自己的 boot 标记重定向到临时目录（`DSH_INTERJECT_BOOT`），否则跑一次自检就会
+> 把这里的证据冲掉。如果这个文件里的 `pid` 不是你正在用的 DSH 进程，说明它被别的东西写过。
+
 离线自检（不需要 DSH）：
 
 ```bash
-node test/test-interject.mjs        # 39 项：策略、能力探测、退化路径
-node test/test-interject-loop.mjs   # 15 项：接一份照抄 agent-loop 的迷你 driver
+node test/test-interject.mjs        # 46 项：策略、能力探测、退化路径
+node test/test-interject-loop.mjs   # 18 项：接一份照抄 agent-loop 的迷你 driver
 ```
 
 两个脚本默认测 `../lib/index.js`；用 `DSH_INTERJECT_ENTRY` 可指向别的构建产物。
@@ -143,8 +160,8 @@ node test/test-interject-loop.mjs   # 15 项：接一份照抄 agent-loop 的迷
 
 每个能力都是**探测**而不是假设它存在——插件不 import 任何 `@deepseek-ai/*` 包，只用宿主传进来的
 `ctx` / `agent` 对象。这样做不是为了兼容更老的版本，而是让它在未来的 0.3 / 0.4 上不会因为某个
-内部字段改名就整个失效：探测不到的一律退化为公开写法（例如拿不到 `phase` 就走 `remove` +
-`followup`，而不是唤醒闩）。
+内部字段改名就整个失效：探测不到的一律退化为公开写法（例如拿不到 `phase` 就走「等
+`agent/status` 报 idle 再 `steer`」，而不是唤醒闩）。
 
 这三个版本一致的公开面：`ctx.agents.get/roots`、`agent.session`、`agent.status`、
 `agent.inbox.{nextTurn,nextStep,hasPending,claim,append,prepend,replace,remove,splice}`、
@@ -161,8 +178,9 @@ node test/test-interject-loop.mjs   # 15 项：接一份照抄 agent-loop 的迷
 - **搬消息会留下一次 `outcome: 'canceled'` 的 `agent/inbox/spliced`**：公开 API 的固有形状
   （`inbox.remove()` 走 `splice()`）。已核实无害：goal driver 的 `sameQueued()` 要求
   `source.kind === 'goal'`；UI 的 `retireFailedSubmission()` 对纯文本提交不产生错误。
-- **`interrupt` 模式依赖 `agent.phase.wakeRequested`** 这一处内部字段；拿不到时自动退化为
-  `inbox.remove()` + `agent.followup()`。
+- **`interrupt` 模式优先摸 `agent.phase.wakeRequested`** 这一处内部字段（能闩上就还在同一个
+  turn 里继续，最快）；闩不上时自动退到**公开路径**：等 `agent/status` 事件报 idle 再
+  `steer()` 补送，兜底 `wakeFallbackMs` 毫秒。两条路都有离线测试覆盖。
 - **改 `lib/index.js` 必须完全重启 DSH**（托盘退出，不是关窗口）。只有 JSON 配置是热加载的。
 
 ---
